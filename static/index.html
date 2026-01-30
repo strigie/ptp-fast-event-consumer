@@ -1,0 +1,569 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PTP Fast Event Consumer - Status Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            /* OpenShift Console 4.20 Color Palette */
+            --pf-global--BackgroundColor--100: #151515;
+            --pf-global--BackgroundColor--200: #1e1e1e;
+            --pf-global--BackgroundColor--300: #2b2b2b;
+            --pf-global--Color--100: #ededed;
+            --pf-global--Color--200: #d2d2d2;
+            --pf-global--BorderColor--100: #3c3f41;
+            --pf-global--primary-color--100: #06c;
+            --pf-global--primary-color--200: #004080;
+            --pf-global--success-color--100: #3e8635;
+            --pf-global--danger-color--100: #c9190b;
+            --pf-global--warning-color--100: #f0ab00;
+            --pf-global--info-color--100: #2b9af3;
+        }
+
+        body {
+            font-family: 'RedHatText', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: var(--pf-global--BackgroundColor--100);
+            min-height: 100vh;
+            color: var(--pf-global--Color--100);
+            line-height: 1.5;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            background: var(--pf-global--BackgroundColor--200);
+            min-height: 100vh;
+        }
+
+        .header {
+            background: var(--pf-global--BackgroundColor--300);
+            border-bottom: 1px solid var(--pf-global--BorderColor--100);
+            padding: 24px 32px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .header h1 {
+            font-size: 1.75rem;
+            font-weight: 600;
+            color: var(--pf-global--Color--100);
+            margin: 0;
+        }
+
+        .header .status {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .status-indicator {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+
+        .status-indicator.connected {
+            background-color: var(--pf-global--success-color--100);
+        }
+
+        .status-indicator.disconnected {
+            background-color: var(--pf-global--danger-color--100);
+            animation: none;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .content {
+            padding: 24px 32px;
+        }
+
+        .toolbar {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 24px;
+            flex-wrap: wrap;
+        }
+
+        button {
+            background: var(--pf-global--primary-color--100);
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.875rem;
+            font-weight: 500;
+            transition: background 0.15s;
+            height: 36px;
+        }
+
+        button:hover {
+            background: var(--pf-global--primary-color--200);
+        }
+
+        button:active {
+            transform: scale(0.98);
+        }
+
+        button.secondary {
+            background: var(--pf-global--BackgroundColor--300);
+            color: var(--pf-global--Color--100);
+            border: 1px solid var(--pf-global--BorderColor--100);
+        }
+
+        button.secondary:hover {
+            background: var(--pf-global--BackgroundColor--100);
+        }
+
+        button.danger {
+            background: var(--pf-global--danger-color--100);
+        }
+
+        button.danger:hover {
+            background: #a00;
+        }
+
+        .status-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+
+        .status-card {
+            background: var(--pf-global--BackgroundColor--300);
+            border: 1px solid var(--pf-global--BorderColor--100);
+            border-radius: 4px;
+            padding: 16px;
+            transition: border-color 0.15s;
+        }
+
+        .status-card:hover {
+            border-color: var(--pf-global--primary-color--100);
+        }
+
+        .status-card h3 {
+            color: var(--pf-global--Color--200);
+            margin-bottom: 12px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .status-card .value {
+            font-size: 1.5rem;
+            font-weight: 600;
+            color: var(--pf-global--Color--100);
+            margin-bottom: 8px;
+        }
+
+        .status-card .value.unknown {
+            color: var(--pf-global--Color--200);
+            font-style: italic;
+        }
+
+        .timestamp {
+            font-size: 0.75rem;
+            color: var(--pf-global--Color--200);
+            margin-top: 8px;
+        }
+
+        .section {
+            background: var(--pf-global--BackgroundColor--300);
+            border: 1px solid var(--pf-global--BorderColor--100);
+            border-radius: 4px;
+            margin-bottom: 24px;
+        }
+
+        .section-header {
+            padding: 16px 20px;
+            border-bottom: 1px solid var(--pf-global--BorderColor--100);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .section-header h2 {
+            font-size: 1rem;
+            font-weight: 600;
+            color: var(--pf-global--Color--100);
+            margin: 0;
+        }
+
+        .section-content {
+            padding: 20px;
+        }
+
+        .event-log {
+            background: #0d1117;
+            color: #c9d1d9;
+            border-radius: 4px;
+            padding: 16px;
+            max-height: 500px;
+            overflow-y: auto;
+            font-family: 'RedHatMono', 'Courier New', monospace;
+            font-size: 0.8125rem;
+        }
+
+        .event-entry {
+            padding: 12px;
+            margin-bottom: 8px;
+            border-left: 3px solid var(--pf-global--info-color--100);
+            background: #161b22;
+            border-radius: 4px;
+        }
+
+        .event-entry .time {
+            color: #8b949e;
+            font-size: 0.75rem;
+            margin-bottom: 4px;
+        }
+
+        .event-entry .data {
+            color: #c9d1d9;
+            margin-top: 8px;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+
+        .subscription-item {
+            background: var(--pf-global--BackgroundColor--200);
+            border: 1px solid var(--pf-global--BorderColor--100);
+            border-radius: 4px;
+            padding: 16px;
+            margin-bottom: 12px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .subscription-item:hover {
+            border-color: var(--pf-global--primary-color--100);
+        }
+
+        .subscription-info {
+            flex: 1;
+        }
+
+        .subscription-info .resource {
+            font-weight: 600;
+            color: var(--pf-global--Color--100);
+            margin-bottom: 6px;
+            font-size: 0.875rem;
+        }
+
+        .subscription-info .details {
+            font-size: 0.8125rem;
+            color: var(--pf-global--Color--200);
+            margin-bottom: 4px;
+        }
+
+        .subscription-info .id {
+            font-family: 'RedHatMono', 'Courier New', monospace;
+            font-size: 0.75rem;
+            color: var(--pf-global--Color--200);
+            margin-top: 4px;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 24px;
+            color: var(--pf-global--Color--200);
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 48px 24px;
+            color: var(--pf-global--Color--200);
+        }
+
+        .empty-state-icon {
+            font-size: 3rem;
+            margin-bottom: 16px;
+            opacity: 0.5;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>PTP Fast Event Consumer</h1>
+            <div class="status">
+                <span class="status-indicator" id="statusIndicator"></span>
+                <span id="connectionStatus">Connecting...</span>
+            </div>
+        </div>
+        <div class="content">
+            <div class="toolbar">
+                <button onclick="checkSubscriptions()">Check Subscriptions</button>
+                <button onclick="resubscribe()">Resubscribe to Events</button>
+                <button class="secondary" onclick="clearLog()">Clear Log</button>
+            </div>
+
+            <div id="subscriptionsSection" class="section" style="display: none;">
+                <div class="section-header">
+                    <h2>Current Subscriptions</h2>
+                    <button class="secondary" onclick="document.getElementById('subscriptionsSection').style.display='none'">Close</button>
+                </div>
+                <div class="section-content">
+                    <div id="subscriptionsList">
+                        <div class="loading">Loading subscriptions...</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="status-grid">
+                <div class="status-card">
+                    <h3>OS Clock Sync State</h3>
+                    <div class="value" id="osClockSyncState">-</div>
+                    <div class="timestamp" id="osClockSyncTimestamp">-</div>
+                </div>
+
+                <div class="status-card">
+                    <h3>Lock State</h3>
+                    <div class="value" id="lockState">-</div>
+                    <div class="timestamp" id="lockStateTimestamp">-</div>
+                </div>
+
+                <div class="status-card">
+                    <h3>Clock Class</h3>
+                    <div class="value" id="clockClass">-</div>
+                    <div class="timestamp" id="clockClassTimestamp">-</div>
+                </div>
+            </div>
+
+            <div class="section">
+                <div class="section-header">
+                    <h2>Event Log</h2>
+                </div>
+                <div class="section-content">
+                    <div class="event-log" id="eventLog">
+                        <div class="loading">Waiting for events...</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let eventSource = null;
+        let lastUpdate = null;
+
+        function updateStatus(data) {
+            lastUpdate = new Date(data.timestamp || new Date().toISOString());
+            
+            // Update OS Clock Sync State
+            const osClockSyncState = data.os_clock_sync_state || 'Unknown';
+            document.getElementById('osClockSyncState').textContent = osClockSyncState;
+            document.getElementById('osClockSyncState').className = osClockSyncState === 'Unknown' ? 'value unknown' : 'value';
+            document.getElementById('osClockSyncTimestamp').textContent = `Last updated: ${formatTimestamp(data.timestamp)}`;
+
+            // Update Lock State
+            const lockState = data.lock_state || 'Unknown';
+            document.getElementById('lockState').textContent = lockState;
+            document.getElementById('lockState').className = lockState === 'Unknown' ? 'value unknown' : 'value';
+            document.getElementById('lockStateTimestamp').textContent = `Last updated: ${formatTimestamp(data.timestamp)}`;
+
+            // Update Clock Class
+            const clockClass = data.clock_class !== null && data.clock_class !== undefined ? data.clock_class : 'Unknown';
+            document.getElementById('clockClass').textContent = clockClass;
+            document.getElementById('clockClass').className = clockClass === 'Unknown' ? 'value unknown' : 'value';
+            document.getElementById('clockClassTimestamp').textContent = `Last updated: ${formatTimestamp(data.timestamp)}`;
+
+            // Add to event log
+            addEventLog(data);
+        }
+
+        function formatTimestamp(timestamp) {
+            if (!timestamp) return 'N/A';
+            try {
+                const date = new Date(timestamp);
+                return date.toLocaleString();
+            } catch (e) {
+                return timestamp;
+            }
+        }
+
+        function addEventLog(data) {
+            const logDiv = document.getElementById('eventLog');
+            if (logDiv.querySelector('.loading')) {
+                logDiv.innerHTML = '';
+            }
+
+            const entry = document.createElement('div');
+            entry.className = 'event-entry';
+            entry.innerHTML = `
+                <div class="time">${formatTimestamp(data.timestamp)}</div>
+                <div class="data">${JSON.stringify(data, null, 2)}</div>
+            `;
+            logDiv.insertBefore(entry, logDiv.firstChild);
+
+            // Keep only last 50 entries
+            while (logDiv.children.length > 50) {
+                logDiv.removeChild(logDiv.lastChild);
+            }
+        }
+
+        function clearLog() {
+            document.getElementById('eventLog').innerHTML = '<div class="loading">Log cleared. Waiting for events...</div>';
+        }
+
+        function checkSubscriptions() {
+            const section = document.getElementById('subscriptionsSection');
+            const list = document.getElementById('subscriptionsList');
+            
+            section.style.display = 'block';
+            list.innerHTML = '<div class="loading">Loading subscriptions...</div>';
+            
+            fetch('/api/subscriptions')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.status === 'success' && data.subscriptions) {
+                        displaySubscriptions(data.subscriptions);
+                    } else {
+                        list.innerHTML = `<div class="empty-state">${data.message || 'No subscriptions found'}</div>`;
+                    }
+                })
+                .catch(err => {
+                    console.error('Failed to fetch subscriptions:', err);
+                    list.innerHTML = '<div class="empty-state" style="color: var(--pf-global--danger-color--100);">Failed to load subscriptions</div>';
+                });
+        }
+
+        function displaySubscriptions(subscriptions) {
+            const list = document.getElementById('subscriptionsList');
+            
+            if (subscriptions.length === 0) {
+                list.innerHTML = '<div class="empty-state"><div class="empty-state-icon">📭</div>No active subscriptions</div>';
+                return;
+            }
+            
+            list.innerHTML = '';
+            
+            subscriptions.forEach(sub => {
+                const item = document.createElement('div');
+                item.className = 'subscription-item';
+                
+                const resourceAddress = sub.ResourceAddress || sub.resourceAddress || 'Unknown';
+                const subscriptionId = sub.SubscriptionId || sub.subscriptionId || 'Unknown';
+                const endpointUri = sub.EndpointUri || sub.endpointUri || 'Unknown';
+                
+                item.innerHTML = `
+                    <div class="subscription-info">
+                        <div class="resource">${resourceAddress}</div>
+                        <div class="details">Endpoint: ${endpointUri}</div>
+                        <div class="id">ID: ${subscriptionId}</div>
+                    </div>
+                    <button class="danger" onclick="unsubscribe('${subscriptionId}', '${resourceAddress.replace(/'/g, "\\'")}')">Unsubscribe</button>
+                `;
+                
+                list.appendChild(item);
+            });
+        }
+
+        function unsubscribe(subscriptionId, resourceAddress) {
+            if (!confirm(`Are you sure you want to unsubscribe from:\n${resourceAddress}?`)) {
+                return;
+            }
+            
+            fetch(`/api/subscriptions/${subscriptionId}`, { method: 'DELETE' })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.status === 'success') {
+                        alert('Successfully unsubscribed!');
+                        checkSubscriptions(); // Refresh the list
+                    } else {
+                        alert(`Failed to unsubscribe: ${data.message || 'Unknown error'}`);
+                    }
+                })
+                .catch(err => {
+                    console.error('Failed to unsubscribe:', err);
+                    alert('Failed to unsubscribe. Please check the console for details.');
+                });
+        }
+
+        function resubscribe() {
+            if (!confirm('This will resubscribe to all PTP events. Continue?')) {
+                return;
+            }
+            
+            fetch('/api/subscriptions/resubscribe', { method: 'POST' })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.status === 'success') {
+                        alert('Successfully resubscribed to PTP events!');
+                        checkSubscriptions(); // Refresh the subscriptions list
+                    } else {
+                        alert(`Failed to resubscribe: ${data.message || 'Unknown error'}`);
+                    }
+                })
+                .catch(err => {
+                    console.error('Failed to resubscribe:', err);
+                    alert('Failed to resubscribe. Please check the console for details.');
+                });
+        }
+
+        function connectSSE() {
+            const statusIndicator = document.getElementById('statusIndicator');
+            const connectionStatus = document.getElementById('connectionStatus');
+
+            if (eventSource) {
+                eventSource.close();
+            }
+
+            eventSource = new EventSource('/api/sse');
+
+            eventSource.onopen = () => {
+                statusIndicator.className = 'status-indicator connected';
+                connectionStatus.textContent = 'Connected - Receiving real-time updates';
+            };
+
+            eventSource.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    updateStatus(data);
+                } catch (e) {
+                    console.error('Failed to parse event data:', e);
+                }
+            };
+
+            eventSource.onerror = (error) => {
+                statusIndicator.className = 'status-indicator disconnected';
+                connectionStatus.textContent = 'Disconnected - Attempting to reconnect...';
+                console.error('SSE error:', error);
+                
+                // Attempt to reconnect after 3 seconds
+                setTimeout(() => {
+                    if (eventSource.readyState === EventSource.CLOSED) {
+                        connectSSE();
+                    }
+                }, 3000);
+            };
+        }
+
+        // Initialize connection on page load
+        connectSSE();
+
+        // Cleanup on page unload
+        window.addEventListener('beforeunload', () => {
+            if (eventSource) {
+                eventSource.close();
+            }
+        });
+    </script>
+</body>
+</html>

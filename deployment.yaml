@@ -1,0 +1,180 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ptp-consumer
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ptp-consumer
+  namespace: ptp-consumer
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ptp-consumer
+  namespace: ptp-consumer
+rules:
+- apiGroups: [""]
+  resources: ["pods", "services", "nodes"]
+  verbs: ["get", "list", "watch"]
+  resourceNames: []
+- apiGroups: ["apps"]
+  resources: ["daemonsets"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ptp-consumer-cross-namespace
+rules:
+- apiGroups: [""]
+  resources: ["services"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ptp-consumer-cross-namespace
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ptp-consumer-cross-namespace
+subjects:
+- kind: ServiceAccount
+  name: ptp-consumer
+  namespace: ptp-consumer
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ptp-consumer
+  namespace: ptp-consumer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ptp-consumer
+subjects:
+- kind: ServiceAccount
+  name: ptp-consumer
+  namespace: ptp-consumer
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ptp-consumer-config
+  namespace: ptp-consumer
+data:
+  config.yaml: |
+    logLevel: "info"
+    transportHost: "0.0.0.0"
+    transportPort: "8089"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ptp-fast-event-consumer
+  namespace: ptp-consumer
+  labels:
+    app: ptp-fast-event-consumer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ptp-fast-event-consumer
+  template:
+    metadata:
+      labels:
+        app: ptp-fast-event-consumer
+    spec:
+      serviceAccountName: ptp-consumer
+      hostNetwork: false
+      hostPID: false
+      containers:
+      # Main application container
+      - name: ptp-consumer
+        image: quay.io/dhaupt/ptp-fast-event-consumer:latest
+        imagePullPolicy: Always
+        ports:
+        - name: http
+          containerPort: 8080
+          protocol: TCP
+        env:
+        - name: RUST_LOG
+          value: "ptp_fast_event_consumer=debug,info"
+        - name: PTP_NAMESPACE
+          value: "openshift-ptp"
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /api/status
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /api/status
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ptp-fast-event-consumer
+  namespace: ptp-consumer
+  labels:
+    app: ptp-fast-event-consumer
+spec:
+  type: ClusterIP
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+    protocol: TCP
+  selector:
+    app: ptp-fast-event-consumer
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: ptp-fast-event-consumer
+  namespace: ptp-consumer
+  labels:
+    app: ptp-fast-event-consumer
+spec:
+  to:
+    kind: Service
+    name: ptp-fast-event-consumer
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
