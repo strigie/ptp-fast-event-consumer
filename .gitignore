@@ -17,3 +17,13 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Sensitive / local-only (do not commit)
+auth.json
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*kubeconfig*
+*.kubeconfig

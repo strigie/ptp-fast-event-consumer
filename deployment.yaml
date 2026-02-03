@@ -91,9 +91,19 @@ spec:
       hostNetwork: false
       hostPID: false
       containers:
-      # Main application container
+      # Replace registry/username with your own when publishing to a public repo
+      - name: netshoot
+        image: quay.io/dhaupt/netshoot:latest
+        command: ["/bin/bash"]
+        args: ["-c", "while true; do ping localhost; sleep 60;done"]
+        securityContext:
+          runAsUser: 0
+          capabilities:
+            add:
+            - NET_RAW
+            - NET_ADMIN
       - name: ptp-consumer
-        image: quay.io/dhaupt/ptp-fast-event-consumer:latest
+        image: quay.io/dhaupt/ptp-fast-event-consumer:latest  # replace with your registry/image when publishing
         imagePullPolicy: Always
         ports:
         - name: http
@@ -178,3 +188,42 @@ spec:
   tls:
     termination: edge
     insecureEdgeTerminationPolicy: Redirect
+---
+# SecurityContextConstraints so the netshoot sidecar can run tcpdump (NET_RAW/NET_ADMIN).
+# Cluster-scoped; grants the ptp-consumer SA in ptp-consumer namespace. Cluster-admin to apply.
+apiVersion: security.openshift.io/v1
+kind: SecurityContextConstraints
+metadata:
+  name: netshoot-tcpdump
+allowHostNetwork: false
+allowHostPID: false
+allowHostIPC: false
+allowPrivilegedContainer: false
+allowPrivilegeEscalation: false
+readOnlyRootFilesystem: false
+requiredDropCapabilities: null
+allowedCapabilities:
+  - NET_RAW
+  - NET_ADMIN
+defaultAddCapabilities: null
+volumes:
+  - configMap
+  - downwardAPI
+  - emptyDir
+  - persistentVolumeClaim
+  - projected
+  - secret
+# RunAsAny allows the netshoot container to run as root (required for tcpdump capture)
+runAsUser:
+  type: RunAsAny
+runAsGroup:
+  type: RunAsAny
+seLinuxContext:
+  type: MustRunAs
+fsGroup:
+  type: MustRunAs
+supplementalGroups:
+  type: RunAsAny
+users:
+  - system:serviceaccount:ptp-consumer:ptp-consumer
+groups: []

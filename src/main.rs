@@ -1,10 +1,12 @@
 use axum::{
-    extract::{Path, State, ConnectInfo},
-    http::{StatusCode, Method, Uri},
+    extract::{Path, Query, Request, State, ConnectInfo},
+    http::{HeaderMap, StatusCode, Method, Uri},
+    middleware::Next,
     response::{sse::Event, IntoResponse, Sse},
     routing::{get, post},
     Json, Router,
 };
+use axum::body::{Body, to_bytes};
 use std::net::SocketAddr;
 // CloudEvents support - we'll parse JSON directly
 use serde::{Deserialize, Serialize};
@@ -12,26 +14,25 @@ use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     convert::Infallible,
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::Duration,
 };
 use tokio::sync::broadcast;
-use tokio_stream::{wrappers::BroadcastStream, Stream as _, StreamExt};
+use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use tower_http::services::ServeDir;
 use tracing::{error, info, warn};
 use kube::{Api, Client, ResourceExt};
 use k8s_openapi::api::core::v1::{Service, Node};
+use percent_encoding::percent_decode_str;
 
 // Application state
 #[derive(Clone)]
 struct AppState {
-    // Channel for broadcasting PTP status updates
     tx: broadcast::Sender<PtpStatus>,
-    // HTTP client for making requests to cloud-event-proxy
+    last_status: Arc<RwLock<PtpStatus>>,
     client: reqwest::Client,
-    // Kubernetes client
+    #[allow(dead_code)]
     k8s_client: Client,
-    // Cached PTP configuration
     ptp_config: Arc<PtpConfig>,
 }
 
@@ -41,16 +42,35 @@ struct PtpConfig {
     proxy_url: String,
     callback_uri: String,
     node_name: String,
+    #[allow(dead_code)]
     ptp_namespace: String,
 }
 
-// PTP Status structure
+// PTP Status structure (also used for event log: request_* and request_body)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PtpStatus {
     timestamp: String,
     os_clock_sync_state: Option<String>,
     lock_state: Option<String>,
     clock_class: Option<u8>,
+    /// Source IP of the HTTP request (for event log)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_ip: Option<String>,
+    /// HTTP method (for event log)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    method: Option<String>,
+    /// Request URI (for event log)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uri: Option<String>,
+    /// Raw HTTP body / CloudEvent JSON (for event log)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_body: Option<Value>,
+    /// Direct connection peer IP (e.g. OpenShift router 100.64.0.2)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    direct_peer_ip: Option<String>,
+    /// Request headers for HTTP-style event log (e.g. {"X-Forwarded-For": "..."})
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_headers: Option<HashMap<String, String>>,
     #[serde(flatten)]
     additional: HashMap<String, Value>,
 }
@@ -64,7 +84,26 @@ struct SubscriptionRequest {
     resource_address: String,
 }
 
-// Publisher structure from /publishers endpoint
+// Body for POST /api/subscriptions/unsubscribe (browser sends this; our app then sends DELETE to cloud-event-proxy)
+#[derive(Deserialize, Debug)]
+struct UnsubscribeBody {
+    #[serde(alias = "deleteTarget")]
+    delete_target: Option<String>,
+    #[serde(alias = "subscriptionId")]
+    subscription_id: Option<String>,
+}
+
+// Query for GET /api/subscriptions/unsubscribe?deleteTarget=xxx (fallback when POST is blocked by Route/ingress)
+#[derive(Deserialize, Debug)]
+struct UnsubscribeQuery {
+    #[serde(alias = "deleteTarget")]
+    delete_target: Option<String>,
+    #[serde(alias = "subscriptionId")]
+    subscription_id: Option<String>,
+}
+
+// Publisher structure from /publishers endpoint (for future use)
+#[allow(dead_code, non_snake_case)]
 #[derive(Deserialize, Debug)]
 struct Publisher {
     #[serde(rename = "ResourceAddress")]
@@ -95,6 +134,21 @@ async fn main() -> anyhow::Result<()> {
     // Create broadcast channel for SSE
     let (tx, _rx) = broadcast::channel::<PtpStatus>(100);
 
+    // Last known status (merged across events)
+    let last_status = Arc::new(RwLock::new(PtpStatus {
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        os_clock_sync_state: None,
+        lock_state: None,
+        clock_class: None,
+        source_ip: None,
+        method: None,
+        uri: None,
+        request_body: None,
+        direct_peer_ip: None,
+        request_headers: None,
+        additional: HashMap::new(),
+    }));
+
     // Create HTTP client
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -102,6 +156,7 @@ async fn main() -> anyhow::Result<()> {
 
     let state = AppState { 
         tx, 
+        last_status,
         client: client.clone(),
         k8s_client: k8s_client.clone(),
         ptp_config: Arc::new(ptp_config),
@@ -115,16 +170,19 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Build the router
+    // Build the router (with request logging for /api/* to debug DELETE not reaching server)
     let app = Router::new()
         .route("/api/events", post(handle_cloudevent))
         .route("/api/events", get(handle_validation)) // GET handler for cloud-event-proxy validation
         .route("/api/status", get(get_status))
         .route("/api/sse", get(sse_handler))
         .route("/api/subscriptions", get(list_subscriptions))
+        .route("/api/subscriptions/unsubscribe", get(unsubscribe_get).post(unsubscribe_post))
         .route("/api/subscriptions/:id", axum::routing::delete(unsubscribe))
-        .route("/api/subscriptions/resubscribe", post(resubscribe_events))
+        .route("/api/subscriptions/resubscribe", get(resubscribe_events).post(resubscribe_events))
+        .route("/api/debug/button-click", get(debug_button_click).post(debug_button_click_post))
         .nest_service("/", ServeDir::new("static"))
+        .layer(axum::middleware::from_fn(log_api_requests))
         .with_state(state);
 
     // Start the server with ConnectInfo support
@@ -276,90 +334,241 @@ async fn subscribe_to_ptp_events(
     Ok(())
 }
 
-// Handle incoming CloudEvents from PTP publisher
+/// Extract string value from a value object (notification or metric). Handles "value" and "Value" keys.
+fn value_from_entry(value_obj: &Value) -> Option<String> {
+    let val = value_obj
+        .get("value")
+        .or_else(|| value_obj.get("Value"));
+    let v = match val {
+        Some(v) => v,
+        None => return None,
+    };
+    v.as_str()
+        .map(|s| s.to_string())
+        .or_else(|| v.as_u64().map(|n| n.to_string()))
+        .or_else(|| v.as_i64().map(|n| n.to_string()))
+        .or_else(|| v.as_f64().map(|n| n.to_string()))
+}
+
+/// Parse CloudEvent payload into status fields from data.values[] (ResourceAddress + value).
+fn parse_values_from_payload(payload: &Value) -> (String, Option<String>, Option<String>, Option<u8>, HashMap<String, Value>) {
+    let timestamp = payload
+        .get("time")
+        .or_else(|| payload.get("timestamp"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+    let mut os_clock_sync_state = None;
+    let mut lock_state = None;
+    let mut clock_class = None;
+    let mut additional = HashMap::new();
+
+    let data = match payload.get("data") {
+        Some(d) if d.as_str().is_some() => serde_json::from_str::<Value>(d.as_str().unwrap_or("")).ok(),
+        Some(d) if d.as_object().is_some() => Some(d.clone()),
+        _ => None,
+    };
+
+    if let Some(data_val) = data {
+        if let Some(values) = data_val.get("values").and_then(|v| v.as_array()) {
+            for value_obj in values {
+                let resource_addr = match value_obj.get("ResourceAddress").or_else(|| value_obj.get("resourceAddress")).and_then(|r| r.as_str()) {
+                    Some(a) => a,
+                    None => continue,
+                };
+                let data_type = value_obj.get("data_type").or_else(|| value_obj.get("dataType")).and_then(|v| v.as_str());
+                // Prefer notification for state enums; accept metric for numeric
+                let is_notification = data_type == Some("notification");
+
+                if let Some(val_str) = value_from_entry(value_obj) {
+                    let addr_lower = resource_addr.to_lowercase();
+                    let addr_lower_compact = addr_lower.replace("-", "").replace("_", "");
+                    if addr_lower.contains("os-clock-sync-state") || resource_addr.contains("CLOCK_REALTIME") {
+                        if is_notification || os_clock_sync_state.is_none() {
+                            os_clock_sync_state = Some(val_str);
+                        }
+                    } else if addr_lower.contains("lock-state") || addr_lower.contains("lock_state")
+                        || addr_lower_compact.contains("lockstate") || addr_lower.contains("sync-state")
+                        || addr_lower.contains("sync_state") || addr_lower_compact.contains("syncstate")
+                        || (addr_lower.contains("ptp") && addr_lower.contains("lock"))
+                    {
+                        if is_notification || lock_state.is_none() {
+                            lock_state = Some(val_str);
+                        }
+                    } else if addr_lower.contains("clock-class") || addr_lower.contains("clock_class")
+                        || addr_lower_compact.contains("clockclass")
+                    {
+                        if let Ok(n) = val_str.parse::<u64>() {
+                            clock_class = Some(n.min(255) as u8);
+                        }
+                    }
+                }
+                additional.insert(resource_addr.to_string(), value_obj.clone());
+            }
+        }
+        // Fallback: check data for direct keys (multiple naming conventions)
+        if lock_state.is_none() {
+            let s = data_val.get("lock_state").or_else(|| data_val.get("lockState"))
+                .or_else(|| data_val.get("lock-state")).or_else(|| data_val.get("LockState"))
+                .or_else(|| data_val.get("sync_state")).or_else(|| data_val.get("syncState"))
+                .or_else(|| data_val.get("sync-state")).and_then(|v| v.as_str());
+            if let Some(s) = s {
+                lock_state = Some(s.to_string());
+            }
+        }
+        if clock_class.is_none() {
+            let n = data_val.get("clock_class").or_else(|| data_val.get("clockClass"))
+                .or_else(|| data_val.get("clock-class")).or_else(|| data_val.get("ClockClass"))
+                .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|x| x as u64)));
+            if let Some(n) = n {
+                clock_class = Some(n.min(255) as u8);
+            }
+        }
+    }
+    // Top-level payload fallbacks (some CloudEvents put fields at root or in data as string)
+    if lock_state.is_none() {
+        let s = payload.get("lock_state").or_else(|| payload.get("lockState"))
+            .or_else(|| payload.get("lock-state")).and_then(|v| v.as_str());
+        if let Some(s) = s {
+            lock_state = Some(s.to_string());
+        }
+    }
+    if clock_class.is_none() {
+        let n = payload.get("clock_class").or_else(|| payload.get("clockClass"))
+            .or_else(|| payload.get("clock-class")).and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|x| x as u64)));
+        if let Some(n) = n {
+            clock_class = Some(n.min(255) as u8);
+        }
+    }
+
+    if let Some(source) = payload.get("source").and_then(|s| s.as_str()) {
+        additional.insert("source".to_string(), json!(source));
+    }
+
+    (timestamp, os_clock_sync_state, lock_state, clock_class, additional)
+}
+
+// Process CloudEvent payload and broadcast (run in background). Merges with last known status and includes request metadata for event log.
+fn process_cloudevent_payload(
+    source_ip: String,
+    direct_peer_ip: String,
+    method: String,
+    uri: String,
+    request_headers: HashMap<String, String>,
+    payload: Value,
+    tx: broadcast::Sender<PtpStatus>,
+    last_status: Arc<RwLock<PtpStatus>>,
+) {
+    let (timestamp, os_clock_sync_state, lock_state, clock_class, additional) = parse_values_from_payload(&payload);
+
+    // Merge with last known status (only update fields we got from this event)
+    let merged = {
+        let mut last = last_status.write().unwrap_or_else(|e| e.into_inner());
+        let mut next = PtpStatus {
+            timestamp: timestamp.clone(),
+            os_clock_sync_state: os_clock_sync_state.or(last.os_clock_sync_state.clone()),
+            lock_state: lock_state.or(last.lock_state.clone()),
+            clock_class: clock_class.or(last.clock_class),
+            source_ip: None,
+            method: None,
+            uri: None,
+            request_body: None,
+            direct_peer_ip: None,
+            request_headers: None,
+            additional: last.additional.clone(),
+        };
+        next.additional.extend(additional);
+        // Keep last known for next merge
+        last.timestamp = next.timestamp.clone();
+        last.os_clock_sync_state = next.os_clock_sync_state.clone();
+        last.lock_state = next.lock_state.clone();
+        last.clock_class = next.clock_class;
+        last.additional = next.additional.clone();
+        next
+    };
+
+    let headers_opt = if request_headers.is_empty() {
+        None
+    } else {
+        Some(request_headers)
+    };
+
+    // Broadcast: merged status + this request's metadata and body for event log
+    let to_send = PtpStatus {
+        source_ip: Some(source_ip),
+        direct_peer_ip: Some(direct_peer_ip),
+        method: Some(method),
+        uri: Some(uri),
+        request_body: Some(payload),
+        request_headers: headers_opt,
+        ..merged
+    };
+
+    if let Err(e) = tx.send(to_send) {
+        warn!("Failed to broadcast status update: {}", e);
+    }
+}
+
+// Effective client IP: prefer original sender. Some proxies append to X-Forwarded-For (router, client),
+// so we try last then first. Then X-Real-IP, then direct connection peer (100.64.0.2 is often the router).
+fn effective_client_ip(headers: &HeaderMap, direct: std::net::IpAddr) -> String {
+    if let Some(v) = headers.get("x-forwarded-for") {
+        if let Ok(s) = v.to_str() {
+            let parts: Vec<&str> = s.split(',').map(str::trim).filter(|x| !x.is_empty()).collect();
+            if let Some(last) = parts.last() {
+                return (*last).to_string();
+            }
+            if let Some(first) = parts.first() {
+                return (*first).to_string();
+            }
+        }
+    }
+    if let Some(v) = headers.get("x-real-ip") {
+        if let Ok(s) = v.to_str() {
+            if !s.is_empty() {
+                return s.to_string();
+            }
+        }
+    }
+    direct.to_string()
+}
+
+// All request headers for raw HTTP-style event log display (preserves header names as received).
+fn request_headers_for_log(headers: &HeaderMap) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for (name, value) in headers.iter() {
+        if let Ok(s) = value.to_str() {
+            out.insert(name.as_str().to_string(), s.to_string());
+        }
+    }
+    out
+}
+
+// Handle incoming CloudEvents from PTP publisher.
+// Respond with 204 immediately so cloud-event-proxy validation does not time out; process event in background.
 async fn handle_cloudevent(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     method: Method,
     uri: Uri,
     Json(payload): Json<Value>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    // Log only PTP Event API calls with source IP, method, and URI
-    info!("PTP Event API: {} {} from {}", method, uri, addr.ip());
+    let direct = addr.ip();
+    let client_ip = effective_client_ip(&headers, direct);
+    info!("PTP Event API: {} {} from {}", method, uri, client_ip);
 
-    // Extract PTP status information from the CloudEvent
-    let mut ptp_status = PtpStatus {
-        timestamp: payload
-            .get("time")
-            .or_else(|| payload.get("timestamp"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
-        os_clock_sync_state: None,
-        lock_state: None,
-        clock_class: None,
-        additional: HashMap::new(),
-    };
+    let source_ip = client_ip;
+    let direct_peer_ip = direct.to_string();
+    let method_str = method.to_string();
+    let uri_str = uri.to_string();
+    let request_headers = request_headers_for_log(&headers);
+    let tx = state.tx.clone();
+    let last_status = state.last_status.clone();
+    tokio::spawn(async move {
+        process_cloudevent_payload(source_ip, direct_peer_ip, method_str, uri_str, request_headers, payload, tx, last_status);
+    });
 
-    // Extract data from the CloudEvent according to O-Cloud Notification API v2 format
-    // The data field contains a "values" array with ResourceAddress and value fields
-    if let Some(data) = payload.get("data") {
-        // Handle data as object or string
-        let data_obj = if let Some(str_data) = data.as_str() {
-            serde_json::from_str::<Value>(str_data).ok()
-        } else if data.is_object() {
-            Some(data.clone())
-        } else {
-            None
-        };
-
-        if let Some(data_val) = data_obj {
-            // Extract values array from data
-            if let Some(values) = data_val.get("values").and_then(|v| v.as_array()) {
-                for value_obj in values {
-                    if let Some(resource_addr) = value_obj.get("ResourceAddress").and_then(|r| r.as_str()) {
-                        // Extract value based on ResourceAddress pattern
-                        if let Some(val) = value_obj.get("value") {
-                            if resource_addr.contains("os-clock-sync-state") || resource_addr.contains("CLOCK_REALTIME") {
-                                if let Some(str_val) = val.as_str() {
-                                    ptp_status.os_clock_sync_state = Some(str_val.to_string());
-                                }
-                            } else if resource_addr.contains("lock-state") {
-                                if let Some(str_val) = val.as_str() {
-                                    ptp_status.lock_state = Some(str_val.to_string());
-                                }
-                            } else if resource_addr.contains("clock-class") {
-                                if let Some(num_val) = val.as_u64() {
-                                    ptp_status.clock_class = Some(num_val as u8);
-                                } else if let Some(str_val) = val.as_str() {
-                                    // Try parsing string to number
-                                    if let Ok(num) = str_val.parse::<u64>() {
-                                        ptp_status.clock_class = Some(num as u8);
-                                    }
-                                }
-                            }
-                        }
-                        
-                        // Store the full value object for additional data
-                        ptp_status.additional.insert(resource_addr.to_string(), value_obj.clone());
-                    }
-                }
-            }
-        }
-    }
-    
-    // Also check source field for resource identification
-    if let Some(source) = payload.get("source").and_then(|s| s.as_str()) {
-        ptp_status.additional.insert("source".to_string(), json!(source));
-    }
-
-    // Broadcast the status update
-    if let Err(e) = state.tx.send(ptp_status.clone()) {
-        warn!("Failed to broadcast status update: {}", e);
-    }
-
-    // Return 204 No Content for CloudEvents (cloud-event-proxy expects this for validation)
-    // This indicates the event was successfully processed with no response body
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -385,6 +594,12 @@ async fn sse_handler(
                 os_clock_sync_state: None,
                 lock_state: None,
                 clock_class: None,
+                source_ip: None,
+                method: None,
+                uri: None,
+                request_body: None,
+                direct_peer_ip: None,
+                request_headers: None,
                 additional: HashMap::new(),
             },
         };
@@ -432,7 +647,8 @@ async fn get_status(State(state): State<AppState>) -> Json<Value> {
     }
 }
 
-// Subscription response structure
+// Subscription response structure (matches proxy API response)
+#[allow(dead_code, non_snake_case)]
 #[derive(Deserialize, Debug)]
 struct SubscriptionResponse {
     #[serde(rename = "ResourceAddress")]
@@ -443,6 +659,64 @@ struct SubscriptionResponse {
     SubscriptionId: String,
     #[serde(rename = "UriLocation")]
     UriLocation: Option<String>,
+}
+
+/// Normalize a subscription object from the proxy (various key names) into a consistent shape.
+/// Include UriLocation when present so the frontend can use it for DELETE (proxy may require exact path).
+fn normalize_subscription(item: &Value) -> Value {
+    let get_str = |keys: &[&str]| -> Option<String> {
+        for k in keys {
+            if let Some(v) = item.get(k).and_then(|v| v.as_str()) {
+                return Some(v.to_string());
+            }
+        }
+        None
+    };
+    let subscription_id = get_str(&["SubscriptionId", "subscriptionId", "subscription_id", "Id", "id"])
+        .unwrap_or_else(|| "unknown".to_string());
+    let resource_address = get_str(&["ResourceAddress", "resourceAddress", "resource_address"])
+        .unwrap_or_else(|| "".to_string());
+    let endpoint_uri = get_str(&["EndpointUri", "endpointUri", "endpoint_uri"])
+        .unwrap_or_else(|| "".to_string());
+    let uri_location = get_str(&["UriLocation", "uriLocation", "uri_location"]);
+    let mut out = json!({
+        "subscriptionId": subscription_id,
+        "resourceAddress": resource_address,
+        "endpointUri": endpoint_uri,
+        "SubscriptionId": subscription_id,
+        "ResourceAddress": resource_address,
+        "EndpointUri": endpoint_uri,
+    });
+    if let Some(ref loc) = uri_location {
+        out["uriLocation"] = json!(loc);
+    }
+    out
+}
+
+/// Log every request to /api/* except /api/status (health checks).
+async fn log_api_requests(req: Request<Body>, next: Next) -> impl IntoResponse {
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+    let path = uri.path();
+    if path.starts_with("/api/") && path != "/api/status" {
+        info!("PTP Event API: {} {}", method, uri);
+    }
+    next.run(req).await
+}
+
+// Debug GET: called by frontend when Unsubscribe button is first clicked (before confirm dialog)
+async fn debug_button_click() -> impl IntoResponse {
+    info!("PTP Event API: debug button-click GET (Unsubscribe button clicked in UI)");
+    StatusCode::NO_CONTENT
+}
+
+// Debug POST: verify that POST requests from the browser reach the app (Route/ingress might block POST)
+async fn debug_button_click_post(req: Request<Body>) -> Result<impl IntoResponse, StatusCode> {
+    let (_, body) = req.into_parts();
+    let bytes = to_bytes(body, usize::MAX).await.map_err(|_| StatusCode::BAD_REQUEST)?;
+    let body_str = String::from_utf8_lossy(&bytes);
+    info!("PTP Event API: debug POST received (len {}): {}", bytes.len(), body_str);
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // List current subscriptions
@@ -456,14 +730,18 @@ async fn list_subscriptions(
         Ok(response) if response.status().is_success() => {
             match response.json::<Value>().await {
                 Ok(json) => {
-                    // Handle both array and null responses
-                    let subscriptions = if json.is_array() {
+                    let raw = if json.is_array() {
                         json.as_array().cloned().unwrap_or_default()
                     } else if json.is_null() {
                         vec![]
                     } else {
                         vec![json]
                     };
+                    let subscriptions: Vec<Value> = raw
+                        .iter()
+                        .filter(|v| v.is_object())
+                        .map(normalize_subscription)
+                        .collect();
                     Ok(Json(json!({
                         "status": "success",
                         "subscriptions": subscriptions
@@ -489,38 +767,98 @@ async fn list_subscriptions(
     }
 }
 
-// Unsubscribe from a specific subscription
-async fn unsubscribe(
-    State(state): State<AppState>,
-    Path(subscription_id): Path<String>,
-) -> Result<impl IntoResponse, StatusCode> {
+// Call cloud-event-proxy to DELETE the subscription. Used by both DELETE and POST handlers.
+async fn do_proxy_unsubscribe(state: &AppState, subscription_id: String) -> Result<Json<Value>, StatusCode> {
     let config = &state.ptp_config;
-    let unsubscribe_url = format!("{}/api/ocloudNotifications/v2/subscriptions/{}", config.proxy_url, subscription_id);
-    
-    info!("Unsubscribing from subscription: {}", subscription_id);
-    
+    let proxy_base = config.proxy_url.trim_end_matches('/');
+    let unsubscribe_url = if subscription_id.starts_with("http://") || subscription_id.starts_with("https://") {
+        subscription_id.clone()
+    } else if subscription_id.starts_with('/') {
+        let id_only = subscription_id.trim_end_matches('/').rsplit('/').next().unwrap_or(&subscription_id);
+        format!("{}/api/ocloudNotifications/v2/subscriptions/{}", proxy_base, id_only)
+    } else {
+        format!("{}/api/ocloudNotifications/v2/subscriptions/{}", proxy_base, subscription_id)
+    };
+    info!("PTP consumer sending DELETE to cloud-event-proxy: {}", unsubscribe_url);
     match state.client.delete(&unsubscribe_url).send().await {
-        Ok(response) if response.status().is_success() => {
-            info!("Successfully unsubscribed from {}", subscription_id);
-            Ok(Json(json!({
-                "status": "success",
-                "message": format!("Successfully unsubscribed from {}", subscription_id)
-            })))
-        }
         Ok(response) => {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            warn!("Failed to unsubscribe from {}: {} - {}", subscription_id, status, body);
-            Ok(Json(json!({
-                "status": "error",
-                "message": format!("Failed to unsubscribe: {} - {}", status, body)
-            })))
+            if status.is_success() {
+                info!("Successfully unsubscribed from proxy: {} - body: {}", status, body);
+                Ok(Json(json!({ "status": "success", "message": "Successfully unsubscribed" })))
+            } else {
+                warn!("Proxy DELETE failed: {} - {}", status, body);
+                Ok(Json(json!({
+                    "status": "error",
+                    "message": format!("Proxy returned {}: {}", status, body)
+                })))
+            }
         }
         Err(e) => {
-            error!("Failed to unsubscribe from {}: {}", subscription_id, e);
+            error!("Failed to call proxy DELETE {}: {}", unsubscribe_url, e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
+}
+
+// GET /api/subscriptions/unsubscribe?deleteTarget=xxx — fallback when POST is blocked (e.g. by OpenShift Route).
+async fn unsubscribe_get(
+    State(state): State<AppState>,
+    Query(q): Query<UnsubscribeQuery>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let subscription_id = q
+        .delete_target
+        .or(q.subscription_id)
+        .filter(|s| !s.is_empty() && s != "Unknown" && s.to_lowercase() != "unknown")
+        .ok_or_else(|| {
+            warn!("Unsubscribe GET missing or invalid deleteTarget/subscriptionId");
+            StatusCode::BAD_REQUEST
+        })?;
+    info!("Unsubscribe GET received (len {}), sending DELETE to cloud-event-proxy", subscription_id.len());
+    do_proxy_unsubscribe(&state, subscription_id).await
+}
+
+// POST /api/subscriptions/unsubscribe — browser sends POST; this app sends DELETE to cloud-event-proxy.
+async fn unsubscribe_post(
+    State(state): State<AppState>,
+    req: Request<Body>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let (_, body) = req.into_parts();
+    let bytes = to_bytes(body, usize::MAX)
+        .await
+        .map_err(|e| {
+            warn!("Unsubscribe POST failed to read body: {}", e);
+            StatusCode::BAD_REQUEST
+        })?;
+    let body_str = String::from_utf8_lossy(&bytes);
+    info!("Unsubscribe POST body (len {}): {}", bytes.len(), body_str);
+    let parsed: UnsubscribeBody = serde_json::from_slice(&bytes).map_err(|e| {
+        warn!("Unsubscribe POST JSON parse error: {} body: {}", e, body_str);
+        StatusCode::BAD_REQUEST
+    })?;
+    let subscription_id = parsed
+        .delete_target
+        .or(parsed.subscription_id)
+        .filter(|s| !s.is_empty() && s != "Unknown" && s.to_lowercase() != "unknown")
+        .ok_or_else(|| {
+            warn!("Unsubscribe POST missing or invalid deleteTarget/subscriptionId");
+            StatusCode::BAD_REQUEST
+        })?;
+    info!("Unsubscribe POST parsed subscription_id (len {}), sending DELETE to cloud-event-proxy", subscription_id.len());
+    do_proxy_unsubscribe(&state, subscription_id).await
+}
+
+// DELETE /api/subscriptions/:id — alternative; same effect (our app sends DELETE to proxy).
+async fn unsubscribe(
+    State(state): State<AppState>,
+    Path(subscription_id_encoded): Path<String>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let subscription_id = percent_decode_str(&subscription_id_encoded)
+        .decode_utf8_lossy()
+        .into_owned();
+    info!("Unsubscribe DELETE received for subscription (len {}), sending DELETE to proxy", subscription_id.len());
+    do_proxy_unsubscribe(&state, subscription_id).await
 }
 
 // Resubscribe to all events

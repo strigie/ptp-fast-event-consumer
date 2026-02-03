@@ -233,11 +233,34 @@
             margin-bottom: 4px;
         }
 
+        .event-entry .event-meta {
+            color: var(--pf-global--info-color--100);
+            font-size: 0.8125rem;
+            margin-bottom: 6px;
+        }
+
+        .event-entry .event-meta .from {
+            color: #8b949e;
+        }
+
+        .event-entry .event-meta.source-ip {
+            color: var(--pf-global--info-color--100);
+            font-weight: 600;
+            margin-bottom: 8px;
+        }
+
         .event-entry .data {
             color: #c9d1d9;
             margin-top: 8px;
             white-space: pre-wrap;
             word-break: break-all;
+        }
+
+        .event-entry .event-http {
+            margin: 0;
+            white-space: pre-wrap;
+            word-break: break-all;
+            font-size: 0.8125rem;
         }
 
         .subscription-item {
@@ -308,10 +331,10 @@
             </div>
         </div>
         <div class="content">
-            <div class="toolbar">
-                <button onclick="checkSubscriptions()">Check Subscriptions</button>
-                <button onclick="resubscribe()">Resubscribe to Events</button>
-                <button class="secondary" onclick="clearLog()">Clear Log</button>
+            <div class="toolbar" id="toolbar">
+                <button type="button" data-action="checkSubscriptions">Check Subscriptions</button>
+                <button type="button" data-action="resubscribe" id="resubscribeBtn">Resubscribe to Events</button>
+                <button type="button" class="secondary" data-action="clearLog">Clear Log</button>
             </div>
 
             <div id="subscriptionsSection" class="section" style="display: none;">
@@ -362,29 +385,48 @@
     <script>
         let eventSource = null;
         let lastUpdate = null;
+        let subscriptionCount = 0;
+
+        function updateConnectionStatus() {
+            var el = document.getElementById('connectionStatus');
+            if (!el) return;
+            if (eventSource && eventSource.readyState === EventSource.OPEN) {
+                if (subscriptionCount >= 1) {
+                    el.textContent = 'Connected - Receiving real-time updates';
+                } else {
+                    el.textContent = 'Connected - No active subscriptions';
+                }
+            }
+        }
 
         function updateStatus(data) {
             lastUpdate = new Date(data.timestamp || new Date().toISOString());
-            
-            // Update OS Clock Sync State
-            const osClockSyncState = data.os_clock_sync_state || 'Unknown';
-            document.getElementById('osClockSyncState').textContent = osClockSyncState;
-            document.getElementById('osClockSyncState').className = osClockSyncState === 'Unknown' ? 'value unknown' : 'value';
+
+            // Only update cards when we have a value (keep last known otherwise)
+            if (data.os_clock_sync_state != null && data.os_clock_sync_state !== '') {
+                const osClockSyncState = data.os_clock_sync_state;
+                document.getElementById('osClockSyncState').textContent = osClockSyncState;
+                document.getElementById('osClockSyncState').className = 'value';
+            }
             document.getElementById('osClockSyncTimestamp').textContent = `Last updated: ${formatTimestamp(data.timestamp)}`;
 
-            // Update Lock State
-            const lockState = data.lock_state || 'Unknown';
-            document.getElementById('lockState').textContent = lockState;
-            document.getElementById('lockState').className = lockState === 'Unknown' ? 'value unknown' : 'value';
+            if (data.lock_state != null && data.lock_state !== '') {
+                const lockState = data.lock_state;
+                document.getElementById('lockState').textContent = lockState;
+                document.getElementById('lockState').className = 'value';
+            }
             document.getElementById('lockStateTimestamp').textContent = `Last updated: ${formatTimestamp(data.timestamp)}`;
 
-            // Update Clock Class
-            const clockClass = data.clock_class !== null && data.clock_class !== undefined ? data.clock_class : 'Unknown';
-            document.getElementById('clockClass').textContent = clockClass;
-            document.getElementById('clockClass').className = clockClass === 'Unknown' ? 'value unknown' : 'value';
+            if (data.clock_class !== null && data.clock_class !== undefined) {
+                document.getElementById('clockClass').textContent = data.clock_class;
+                document.getElementById('clockClass').className = 'value';
+            } else {
+                const el = document.getElementById('clockClass');
+                if (el.textContent === '-' || el.textContent === 'Unknown') el.className = 'value unknown';
+            }
             document.getElementById('clockClassTimestamp').textContent = `Last updated: ${formatTimestamp(data.timestamp)}`;
 
-            // Add to event log
+            // Add to event log (timestamp, source IP, method, URI, body)
             addEventLog(data);
         }
 
@@ -404,18 +446,49 @@
                 logDiv.innerHTML = '';
             }
 
+            const time = formatTimestamp(data.timestamp);
+            const method = data.method != null ? data.method : 'POST';
+            const uri = data.uri != null ? data.uri : '/api/events';
+            const body = data.request_body != null
+                ? (typeof data.request_body === 'string' ? data.request_body : JSON.stringify(data.request_body, null, 2))
+                : (data.request_body === undefined ? JSON.stringify(data, null, 2) : '');
+
+            // Resolved source IP (X-Forwarded-For) shown prominently and in headers
+            var sourceIp = data.source_ip != null && data.source_ip !== '' ? data.source_ip : (data.direct_peer_ip || '-');
+            var headerLines = [];
+            headerLines.push('X-Source-IP: ' + sourceIp);
+            if (data.request_headers && typeof data.request_headers === 'object') {
+                var keys = Object.keys(data.request_headers).sort();
+                for (var i = 0; i < keys.length; i++) {
+                    headerLines.push(keys[i] + ': ' + data.request_headers[keys[i]]);
+                }
+            }
+            var headerBlock = headerLines.join('\n');
+            var httpBlock = method + ' ' + uri + ' HTTP/1.1\n' + headerBlock + (headerBlock ? '\n\n' : '\n') + body;
+
             const entry = document.createElement('div');
             entry.className = 'event-entry';
             entry.innerHTML = `
-                <div class="time">${formatTimestamp(data.timestamp)}</div>
-                <div class="data">${JSON.stringify(data, null, 2)}</div>
+                <div class="time">${time}</div>
+                <div class="event-meta source-ip">Source: ${escapeHtml(sourceIp)}</div>
+                <pre class="event-http">${escapeHtml(httpBlock)}</pre>
             `;
             logDiv.insertBefore(entry, logDiv.firstChild);
 
-            // Keep only last 50 entries
             while (logDiv.children.length > 50) {
                 logDiv.removeChild(logDiv.lastChild);
             }
+        }
+
+        function escapeHtml(text) {
+            var div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+        function escapeAttr(text) {
+            if (text == null) return '';
+            var s = String(text);
+            return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
         }
 
         function clearLog() {
@@ -433,13 +506,18 @@
                 .then(response => response.json())
                 .then(data => {
                     if (data.status === 'success' && data.subscriptions) {
+                        subscriptionCount = data.subscriptions.length;
                         displaySubscriptions(data.subscriptions);
                     } else {
+                        subscriptionCount = 0;
                         list.innerHTML = `<div class="empty-state">${data.message || 'No subscriptions found'}</div>`;
                     }
+                    updateConnectionStatus();
                 })
                 .catch(err => {
                     console.error('Failed to fetch subscriptions:', err);
+                    subscriptionCount = 0;
+                    updateConnectionStatus();
                     list.innerHTML = '<div class="empty-state" style="color: var(--pf-global--danger-color--100);">Failed to load subscriptions</div>';
                 });
         }
@@ -455,64 +533,119 @@
             list.innerHTML = '';
             
             subscriptions.forEach(sub => {
+                const resourceAddress = sub.resourceAddress ?? sub.ResourceAddress ?? 'Unknown';
+                const subscriptionId = sub.subscriptionId ?? sub.SubscriptionId ?? sub.subscription_id ?? 'Unknown';
+                const endpointUri = sub.endpointUri ?? sub.EndpointUri ?? 'Unknown';
+                // Prefer UriLocation for DELETE when proxy provides it (exact path proxy expects)
+                const deleteTarget = sub.uriLocation ?? sub.UriLocation ?? subscriptionId;
+                
                 const item = document.createElement('div');
                 item.className = 'subscription-item';
                 
-                const resourceAddress = sub.ResourceAddress || sub.resourceAddress || 'Unknown';
-                const subscriptionId = sub.SubscriptionId || sub.subscriptionId || 'Unknown';
-                const endpointUri = sub.EndpointUri || sub.endpointUri || 'Unknown';
-                
-                item.innerHTML = `
-                    <div class="subscription-info">
-                        <div class="resource">${resourceAddress}</div>
-                        <div class="details">Endpoint: ${endpointUri}</div>
-                        <div class="id">ID: ${subscriptionId}</div>
-                    </div>
-                    <button class="danger" onclick="unsubscribe('${subscriptionId}', '${resourceAddress.replace(/'/g, "\\'")}')">Unsubscribe</button>
+                const info = document.createElement('div');
+                info.className = 'subscription-info';
+                info.innerHTML = `
+                    <div class="resource">${escapeHtml(resourceAddress)}</div>
+                    <div class="details">Endpoint: ${escapeHtml(endpointUri)}</div>
+                    <div class="id">ID: ${escapeHtml(subscriptionId)}</div>
                 `;
+                item.appendChild(info);
+                
+                const unsubBtn = document.createElement('button');
+                unsubBtn.type = 'button';
+                unsubBtn.className = 'danger unsubscribe-btn';
+                unsubBtn.textContent = 'Unsubscribe';
+                unsubBtn.addEventListener('click', function (e) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (unsubBtn.disabled) return;
+                    console.log('Unsubscribe clicked', { deleteTarget: deleteTarget, resourceAddress: resourceAddress });
+                    fetch('/api/debug/button-click?action=unsubscribe').catch(function () {});
+                    unsubBtn.disabled = true;
+                    unsubBtn.textContent = 'Unsubscribing…';
+                    unsubscribe(deleteTarget, resourceAddress, function () {
+                        unsubBtn.disabled = false;
+                        unsubBtn.textContent = 'Unsubscribe';
+                    });
+                });
+                item.appendChild(unsubBtn);
                 
                 list.appendChild(item);
             });
         }
 
-        function unsubscribe(subscriptionId, resourceAddress) {
-            if (!confirm(`Are you sure you want to unsubscribe from:\n${resourceAddress}?`)) {
+        function unsubscribe(deleteTarget, resourceAddress, onCancel) {
+            if (!deleteTarget || deleteTarget === 'Unknown' || deleteTarget === 'unknown') {
+                alert('Invalid subscription');
+                if (onCancel) onCancel();
                 return;
             }
-            
-            fetch(`/api/subscriptions/${subscriptionId}`, { method: 'DELETE' })
-                .then(response => response.json())
-                .then(data => {
-                    if (data.status === 'success') {
+            // No confirm() — dialog often doesn't appear in embedded/OpenShift contexts, which blocked the request.
+            // Use GET with query param so unsubscribe works even when OpenShift Route blocks POST.
+            const encoded = encodeURIComponent(deleteTarget);
+            const getUrl = '/api/subscriptions/unsubscribe?deleteTarget=' + encoded;
+            console.log('Sending GET to', getUrl);
+            fetch(getUrl, { method: 'GET' })
+                .then(function(response) {
+                    return response.text().then(function(text) {
+                        var data = {};
+                        try { data = text ? JSON.parse(text) : {}; } catch (e) {}
+                        console.log('Unsubscribe response:', response.status, text ? text.slice(0, 200) : '');
+                        return { ok: response.ok, status: response.status, data: data };
+                    });
+                })
+                .then(function(result) {
+                    if (result.ok && result.data.status === 'success') {
                         alert('Successfully unsubscribed!');
-                        checkSubscriptions(); // Refresh the list
+                        checkSubscriptions();
                     } else {
-                        alert(`Failed to unsubscribe: ${data.message || 'Unknown error'}`);
+                        var msg = result.data.message || result.data.error || ('HTTP ' + result.status);
+                        console.warn('Unsubscribe failed:', result.status, msg);
+                        alert('Failed to unsubscribe: ' + msg);
+                        if (onCancel) onCancel();
                     }
                 })
-                .catch(err => {
+                .catch(function(err) {
                     console.error('Failed to unsubscribe:', err);
                     alert('Failed to unsubscribe. Please check the console for details.');
+                    if (onCancel) onCancel();
                 });
         }
 
-        function resubscribe() {
-            if (!confirm('This will resubscribe to all PTP events. Continue?')) {
-                return;
+        function resubscribe(btn) {
+            // No confirm() — dialog often doesn't appear in embedded/OpenShift contexts.
+            var button = btn && btn.nodeName ? btn : document.getElementById('resubscribeBtn');
+            if (button) {
+                button.disabled = true;
+                button.textContent = 'Resubscribing…';
             }
-            
-            fetch('/api/subscriptions/resubscribe', { method: 'POST' })
-                .then(response => response.json())
-                .then(data => {
-                    if (data.status === 'success') {
+            // Use GET so it works when Route blocks POST (same as Unsubscribe).
+            fetch('/api/subscriptions/resubscribe', { method: 'GET' })
+                .then(function(response) {
+                    return response.text().then(function(text) {
+                        var data = {};
+                        try { data = text ? JSON.parse(text) : {}; } catch (e) {}
+                        return { ok: response.ok, data: data };
+                    });
+                })
+                .then(function(result) {
+                    if (button) {
+                        button.disabled = false;
+                        button.textContent = 'Resubscribe to Events';
+                    }
+                    if (result.ok && result.data.status === 'success') {
                         alert('Successfully resubscribed to PTP events!');
-                        checkSubscriptions(); // Refresh the subscriptions list
+                        checkSubscriptions();
                     } else {
-                        alert(`Failed to resubscribe: ${data.message || 'Unknown error'}`);
+                        alert('Failed to resubscribe: ' + (result.data.message || result.data.error || 'Unknown error'));
                     }
                 })
-                .catch(err => {
+                .catch(function(err) {
                     console.error('Failed to resubscribe:', err);
+                    if (button) {
+                        button.disabled = false;
+                        button.textContent = 'Resubscribe to Events';
+                    }
                     alert('Failed to resubscribe. Please check the console for details.');
                 });
         }
@@ -529,7 +662,13 @@
 
             eventSource.onopen = () => {
                 statusIndicator.className = 'status-indicator connected';
-                connectionStatus.textContent = 'Connected - Receiving real-time updates';
+                connectionStatus.textContent = 'Connected';
+                fetch('/api/subscriptions').then(function(r) { return r.json(); }).then(function(d) {
+                    if (d.subscriptions && Array.isArray(d.subscriptions)) {
+                        subscriptionCount = d.subscriptions.length;
+                    }
+                    updateConnectionStatus();
+                }).catch(function() { updateConnectionStatus(); });
             };
 
             eventSource.onmessage = (event) => {
@@ -557,6 +696,16 @@
 
         // Initialize connection on page load
         connectSSE();
+
+        // Toolbar: one delegated click handler (reliable in Firefox and when scripts load in different order)
+        document.getElementById('toolbar').addEventListener('click', function(e) {
+            var btn = e.target && e.target.closest && e.target.closest('button');
+            if (!btn || !btn.getAttribute) return;
+            var action = btn.getAttribute('data-action');
+            if (action === 'checkSubscriptions') { checkSubscriptions(); return; }
+            if (action === 'clearLog') { clearLog(); return; }
+            if (action === 'resubscribe') { resubscribe(btn); return; }
+        });
 
         // Cleanup on page unload
         window.addEventListener('beforeunload', () => {

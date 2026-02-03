@@ -91,7 +91,7 @@ podman push quay.io/<your-username>/ptp-fast-event-consumer:latest
 # Set your kubeconfig
 export KUBECONFIG=/path/to/your/kubeconfig.yaml
 
-# Apply the deployment
+# Apply the deployment (includes SCC for netshoot tcpdump; cluster-admin required)
 oc apply -f deployment.yaml
 
 # Check deployment status
@@ -183,6 +183,25 @@ Example:
 PTP Event API: POST /api/events from 10.128.0.5
 PTP Event API: GET /api/events from 10.128.0.5
 ```
+
+## Packet capture (netshoot / tshark)
+
+The deployment includes a netshoot sidecar with the permissions needed to run tshark. You can decode and display HTTP traffic filtered by IP.
+
+**Note:** This works: `tshark -V -Y "http" -f "host <source-ip>"` inside the netshoot container. Use the dynamic command below so you can cut and paste without editing pod names or IPs.
+
+```bash
+# Set the source IP to filter on (e.g. PTP publisher or router)
+SRC_IP="192.168.1.100"
+
+# Resolve the current pod name
+POD=$(oc get pods -n ptp-consumer -l app=ptp-fast-event-consumer -o jsonpath='{.items[0].metadata.name}')
+
+# Decode and display HTTP traffic to/from that IP
+oc exec -it -n ptp-consumer "$POD" -c netshoot -- tshark -V -Y "http" -f "host $SRC_IP"
+```
+
+Change `SRC_IP` to filter on a different host. Use `-f "src host $SRC_IP"` or `-f "dst host $SRC_IP"` to filter by direction.
 
 ## Troubleshooting
 
@@ -278,6 +297,12 @@ cargo build --release
 cargo run
 ```
 
+## Before publishing to GitHub
+
+- **Do not commit:** `auth.json`, `.env`, kubeconfig files (`*kubeconfig*`, `sno*.yaml`), or `*.pem` / `*.key` (they are in `.gitignore`).
+- **deployment.yaml:** Replace `quay.io/dhaupt` with your own registry/username in the container image fields if you do not want your Quay identity in the repo.
+- **README examples:** Quay and `KUBECONFIG` use placeholders; example IPs (e.g. `192.168.1.100`) are generic.
+
 ## License
 
-This project is provided as-is for use with Red Hat OpenShift PTP Operator.
+MIT License. See [LICENSE](LICENSE).
