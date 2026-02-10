@@ -1,308 +1,62 @@
 # PTP Fast Event Consumer
 
-A Rust-based application for consuming PTP (Precision Time Protocol) events from Red Hat OpenShift's PTP Operator using the O-Cloud Notification API v2. The application provides real-time PTP status monitoring through a web dashboard with subscription management capabilities.
-
-## Features
-
-- **Dynamic Service Discovery**: Automatically discovers PTP services and endpoints from Kubernetes
-- **Event Subscriptions**: Subscribes to PTP events via O-Cloud Notification API v2
-- **Real-time Dashboard**: Web-based UI with Server-Sent Events (SSE) for live updates
-- **Subscription Management**: View, unsubscribe, and resubscribe to PTP events
-- **Event Logging**: Logs PTP Event API calls with source IP, HTTP method, and URI
-
-## Architecture
-
-The application:
-- Discovers the PTP event publisher service in the `openshift-ptp` namespace
-- Automatically determines the node name from the pod's environment
-- Builds resource addresses dynamically based on the discovered node
-- Subscribes to PTP events and receives CloudEvents via HTTP callbacks
-- Provides a web UI for monitoring and managing subscriptions
+Consumes PTP (Precision Time Protocol) events from OpenShift PTP Operator via the O-Cloud Notification API v2 and shows OS clock sync state, lock state, and clock class on a web dashboard with a live event log.
 
 ## Prerequisites
 
-- Rust 1.75+ (or latest for edition2024 support)
-- Podman or Docker for building container images
-- OpenShift/Kubernetes cluster with PTP Operator installed
-- Access to Quay.io or another container registry
-- `oc` (OpenShift CLI) configured with cluster access
+- Rust (for local build)
+- Podman or Docker
+- OpenShift/Kubernetes cluster with PTP Operator
+- `oc` or `kubectl` with cluster access
 
-## Building
+## Build
 
-### Local Build
+**Local:**
 
 ```bash
-# Clone or navigate to the project directory
-cd ptp-fast-event-consumer
-
-# Build the application
 cargo build --release
-
-# Run locally (requires PTP Operator in cluster)
-cargo run
 ```
 
-### Container Build
+**Container:**
 
 ```bash
-# Build the container image
 podman build -t quay.io/<your-username>/ptp-fast-event-consumer:latest .
-
-# Push to registry
 podman push quay.io/<your-username>/ptp-fast-event-consumer:latest
 ```
 
-## Deployment
+## Deploy
 
-### 1. Configure Quay.io Authentication
+1. Create the namespace and apply the manifest:
 
-Create a Quay.io robot account with write permissions and authenticate:
+   ```bash
+   oc apply -f deployment.yaml
+   ```
 
-```bash
-# Create auth.json with your Quay.io credentials
-cat > auth.json <<EOF
-{
-  "auths": {
-    "quay.io": {
-      "auth": "<base64-encoded-username:password>",
-      "email": ""
-    }
-  }
-}
-EOF
+2. Use your image:
 
-# Login to Quay.io
-podman login quay.io --authfile auth.json
-```
+   ```bash
+   oc set image deployment/ptp-fast-event-consumer ptp-consumer=quay.io/<your-username>/ptp-fast-event-consumer:latest -n ptp-consumer
+   oc rollout status deployment/ptp-fast-event-consumer -n ptp-consumer
+   ```
 
-### 2. Build and Push Image
+3. Expose the UI (e.g. route or port-forward):
 
-```bash
-# Build the image
-podman build -t quay.io/<your-username>/ptp-fast-event-consumer:latest .
+   ```bash
+   oc port-forward -n ptp-consumer svc/ptp-fast-event-consumer 8080:8080
+   ```
 
-# Push to registry
-podman push quay.io/<your-username>/ptp-fast-event-consumer:latest
-```
-
-### 3. Deploy to OpenShift
-
-```bash
-# Set your kubeconfig
-export KUBECONFIG=/path/to/your/kubeconfig.yaml
-
-# Apply the deployment (includes SCC for netshoot tcpdump; cluster-admin required)
-oc apply -f deployment.yaml
-
-# Check deployment status
-oc get pods -n ptp-consumer -l app=ptp-fast-event-consumer
-
-# View logs
-oc logs -n ptp-consumer -l app=ptp-fast-event-consumer -c ptp-consumer -f
-```
-
-### 4. Access the Application
-
-Get the route URL:
-
-```bash
-oc get route -n ptp-consumer ptp-fast-event-consumer -o jsonpath='{.spec.host}'
-```
-
-Access via:
-- **Direct**: `https://<route-host>` (if cluster is accessible)
-- **SOCKS5 Proxy**: Configure your browser to use `127.0.0.1:8080` as SOCKS5 proxy, then visit `https://<route-host>`
+   Then open http://localhost:8080
 
 ## Configuration
 
-The application automatically discovers configuration from Kubernetes:
+Set via deployment or env:
 
-- **PTP Namespace**: Set via `PTP_NAMESPACE` environment variable (default: `openshift-ptp`)
-- **Node Name**: Automatically discovered from `NODE_NAME` environment variable (from pod spec)
-- **Service Discovery**: Automatically finds PTP event publisher service and application service
+- `PTP_NAMESPACE` – PTP operator namespace (default: `openshift-ptp`)
+- `NODE_NAME` – Node name (from downward API)
+- `POD_NAMESPACE` – Pod namespace (from downward API)
 
-### Environment Variables
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `PTP_NAMESPACE` | Namespace where PTP Operator is deployed | `openshift-ptp` |
-| `POD_NAMESPACE` | Namespace where this application is deployed | `ptp-consumer` |
-| `NODE_NAME` | Node name (automatically set from pod spec) | - |
-| `RUST_LOG` | Logging level | `ptp_fast_event_consumer=info` |
-
-## API Endpoints
-
-### Web UI
-- `GET /` - Main dashboard
-
-### REST API
-- `GET /api/status` - Get current PTP status
-- `GET /api/sse` - Server-Sent Events stream for real-time updates
-- `POST /api/events` - Receive CloudEvents from PTP Operator (callback endpoint)
-- `GET /api/events` - Validation endpoint for cloud-event-proxy
-- `GET /api/subscriptions` - List all active subscriptions
-- `DELETE /api/subscriptions/:id` - Unsubscribe from a specific subscription
-- `POST /api/subscriptions/resubscribe` - Resubscribe to all PTP events
-
-## Usage
-
-### Web Dashboard
-
-1. **View Status**: The dashboard displays real-time PTP status:
-   - OS Clock Sync State
-   - Lock State
-   - Clock Class
-
-2. **Check Subscriptions**: Click "Check Subscriptions" to view all active subscriptions
-
-3. **Unsubscribe**: Click "Unsubscribe" on any subscription to remove it
-
-4. **Resubscribe**: Click "Resubscribe to Events" to recreate all subscriptions
-
-5. **Event Log**: View incoming CloudEvents in the event log section
-
-### Subscription Management
-
-The application automatically subscribes to:
-- `/cluster/node/<node-name>/sync/sync-status/os-clock-sync-state`
-- `/cluster/node/<node-name>/sync/ptp-status/lock-state`
-- `/cluster/node/<node-name>/sync/ptp-status/clock-class`
-
-Subscriptions are created on application startup. You can manage them via the web UI.
-
-## Logging
-
-The application logs only PTP Event API calls with the following format:
-
-```
-PTP Event API: <HTTP_METHOD> <URI> from <SOURCE_IP>
-```
-
-Example:
-```
-PTP Event API: POST /api/events from 10.128.0.5
-PTP Event API: GET /api/events from 10.128.0.5
-```
-
-## Packet capture (netshoot / tshark)
-
-The deployment includes a netshoot sidecar with the permissions needed to run tshark. You can decode and display HTTP traffic filtered by IP.
-
-**Note:** This works: `tshark -V -Y "http" -f "host <source-ip>"` inside the netshoot container. Use the dynamic command below so you can cut and paste without editing pod names or IPs.
-
-```bash
-# Set the source IP to filter on (e.g. PTP publisher or router)
-SRC_IP="192.168.1.100"
-
-# Resolve the current pod name
-POD=$(oc get pods -n ptp-consumer -l app=ptp-fast-event-consumer -o jsonpath='{.items[0].metadata.name}')
-
-# Decode and display HTTP traffic to/from that IP
-oc exec -it -n ptp-consumer "$POD" -c netshoot -- tshark -V -Y "http" -f "host $SRC_IP"
-```
-
-Change `SRC_IP` to filter on a different host. Use `-f "src host $SRC_IP"` or `-f "dst host $SRC_IP"` to filter by direction.
-
-## Troubleshooting
-
-### Subscriptions Not Working
-
-1. Check that the PTP Operator is installed and running:
-   ```bash
-   oc get pods -n openshift-ptp
-   ```
-
-2. Verify the PTP event publisher service exists:
-   ```bash
-   oc get svc -n openshift-ptp | grep ptp-event-publisher
-   ```
-
-3. Check application logs for subscription errors:
-   ```bash
-   oc logs -n ptp-consumer -l app=ptp-fast-event-consumer -c ptp-consumer | grep -i subscription
-   ```
-
-4. Verify RBAC permissions:
-   ```bash
-   oc get rolebinding -n ptp-consumer ptp-consumer
-   oc get clusterrolebinding ptp-consumer-cross-namespace
-   ```
-
-### No Events Received
-
-1. Verify subscriptions are active:
-   ```bash
-   oc exec -n ptp-consumer <pod-name> -c ptp-consumer -- curl -s http://localhost:8080/api/subscriptions
-   ```
-
-2. Check PTP Operator logs:
-   ```bash
-   oc logs -n openshift-ptp -l app=linuxptp-daemon -c cloud-event-proxy | grep -i subscription
-   ```
-
-3. Verify the callback URI is reachable from the PTP Operator namespace
-
-### UI Not Loading
-
-1. Check the route is created:
-   ```bash
-   oc get route -n ptp-consumer ptp-fast-event-consumer
-   ```
-
-2. Verify the service is running:
-   ```bash
-   oc get svc -n ptp-consumer ptp-fast-event-consumer
-   ```
-
-3. Check pod status:
-   ```bash
-   oc get pods -n ptp-consumer -l app=ptp-fast-event-consumer
-   ```
-
-## Development
-
-### Project Structure
-
-```
-ptp-fast-event-consumer/
-├── src/
-│   └── main.rs          # Main application code
-├── static/
-│   └── index.html       # Web UI
-├── Cargo.toml           # Rust dependencies
-├── Dockerfile           # Container build definition
-├── deployment.yaml      # Kubernetes deployment manifest
-└── README.md            # This file
-```
-
-### Key Dependencies
-
-- `axum` - Web framework
-- `tokio` - Async runtime
-- `reqwest` - HTTP client
-- `kube` - Kubernetes client
-- `serde` / `serde_json` - JSON serialization
-- `tracing` - Logging
-
-### Building Locally
-
-```bash
-# Install Rust (if not already installed)
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# Build
-cargo build --release
-
-# Run
-cargo run
-```
-
-## Before publishing to GitHub
-
-- **Do not commit:** `auth.json`, `.env`, kubeconfig files (`*kubeconfig*`, `sno*.yaml`), or `*.pem` / `*.key` (they are in `.gitignore`).
-- **deployment.yaml:** Replace `quay.io/dhaupt` with your own registry/username in the container image fields if you do not want your Quay identity in the repo.
-- **README examples:** Quay and `KUBECONFIG` use placeholders; example IPs (e.g. `192.168.1.100`) are generic.
+The app discovers the PTP event publisher service and its own callback URL (Kubernetes DNS) and subscribes to os-clock-sync-state, lock-state, and clock-class for the node.
 
 ## License
 
-MIT License. See [LICENSE](LICENSE).
+See [LICENSE](LICENSE).

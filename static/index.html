@@ -64,6 +64,18 @@
             gap: 8px;
         }
 
+        .header .version {
+            font-size: 0.75rem;
+            color: var(--pf-global--Color--200);
+            margin-left: 16px;
+        }
+
+        .header .header-right {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
         .status-indicator {
             display: inline-block;
             width: 10px;
@@ -233,20 +245,25 @@
             margin-bottom: 4px;
         }
 
-        .event-entry .event-meta {
-            color: var(--pf-global--info-color--100);
-            font-size: 0.8125rem;
-            margin-bottom: 6px;
-        }
-
-        .event-entry .event-meta .from {
-            color: #8b949e;
-        }
-
-        .event-entry .event-meta.source-ip {
-            color: var(--pf-global--info-color--100);
+        .event-entry .http-request-line {
+            color: var(--pf-global--primary-color--100);
             font-weight: 600;
-            margin-bottom: 8px;
+            margin: 6px 0 2px 0;
+        }
+
+        .event-entry .connection-line {
+            color: var(--pf-global--info-color--100);
+            margin: 2px 0;
+        }
+
+        .event-entry .http-headers {
+            color: #8b949e;
+            margin: 6px 0 2px 0;
+            font-size: 0.75rem;
+        }
+
+        .event-entry .http-headers .header-line {
+            margin: 1px 0;
         }
 
         .event-entry .data {
@@ -254,13 +271,6 @@
             margin-top: 8px;
             white-space: pre-wrap;
             word-break: break-all;
-        }
-
-        .event-entry .event-http {
-            margin: 0;
-            white-space: pre-wrap;
-            word-break: break-all;
-            font-size: 0.8125rem;
         }
 
         .subscription-item {
@@ -325,16 +335,19 @@
     <div class="container">
         <div class="header">
             <h1>PTP Fast Event Consumer</h1>
-            <div class="status">
-                <span class="status-indicator" id="statusIndicator"></span>
-                <span id="connectionStatus">Connecting...</span>
+            <div class="header-right">
+                <span class="version" id="appVersion" title="Version from Cargo.toml">—</span>
+                <div class="status">
+                    <span class="status-indicator" id="statusIndicator"></span>
+                    <span id="connectionStatus">Connecting...</span>
+                </div>
             </div>
         </div>
         <div class="content">
-            <div class="toolbar" id="toolbar">
-                <button type="button" data-action="checkSubscriptions">Check Subscriptions</button>
-                <button type="button" data-action="resubscribe" id="resubscribeBtn">Resubscribe to Events</button>
-                <button type="button" class="secondary" data-action="clearLog">Clear Log</button>
+            <div class="toolbar">
+                <button onclick="checkSubscriptions()">Check Subscriptions</button>
+                <button onclick="resubscribe()">Resubscribe to Events</button>
+                <button class="secondary" onclick="clearLog()">Clear Log</button>
             </div>
 
             <div id="subscriptionsSection" class="section" style="display: none;">
@@ -385,48 +398,29 @@
     <script>
         let eventSource = null;
         let lastUpdate = null;
-        let subscriptionCount = 0;
-
-        function updateConnectionStatus() {
-            var el = document.getElementById('connectionStatus');
-            if (!el) return;
-            if (eventSource && eventSource.readyState === EventSource.OPEN) {
-                if (subscriptionCount >= 1) {
-                    el.textContent = 'Connected - Receiving real-time updates';
-                } else {
-                    el.textContent = 'Connected - No active subscriptions';
-                }
-            }
-        }
 
         function updateStatus(data) {
             lastUpdate = new Date(data.timestamp || new Date().toISOString());
-
-            // Only update cards when we have a value (keep last known otherwise)
-            if (data.os_clock_sync_state != null && data.os_clock_sync_state !== '') {
-                const osClockSyncState = data.os_clock_sync_state;
-                document.getElementById('osClockSyncState').textContent = osClockSyncState;
-                document.getElementById('osClockSyncState').className = 'value';
-            }
+            
+            // Update OS Clock Sync State (support both snake_case and camelCase from API)
+            const osClockSyncState = data.os_clock_sync_state || data.osClockSyncState || 'Unknown';
+            document.getElementById('osClockSyncState').textContent = osClockSyncState;
+            document.getElementById('osClockSyncState').className = osClockSyncState === 'Unknown' ? 'value unknown' : 'value';
             document.getElementById('osClockSyncTimestamp').textContent = `Last updated: ${formatTimestamp(data.timestamp)}`;
 
-            if (data.lock_state != null && data.lock_state !== '') {
-                const lockState = data.lock_state;
-                document.getElementById('lockState').textContent = lockState;
-                document.getElementById('lockState').className = 'value';
-            }
+            // Update Lock State
+            const lockState = data.lock_state || data.lockState || 'Unknown';
+            document.getElementById('lockState').textContent = lockState;
+            document.getElementById('lockState').className = lockState === 'Unknown' ? 'value unknown' : 'value';
             document.getElementById('lockStateTimestamp').textContent = `Last updated: ${formatTimestamp(data.timestamp)}`;
 
-            if (data.clock_class !== null && data.clock_class !== undefined) {
-                document.getElementById('clockClass').textContent = data.clock_class;
-                document.getElementById('clockClass').className = 'value';
-            } else {
-                const el = document.getElementById('clockClass');
-                if (el.textContent === '-' || el.textContent === 'Unknown') el.className = 'value unknown';
-            }
+            // Update Clock Class
+            const clockClass = data.clock_class !== null && data.clock_class !== undefined ? data.clock_class : (data.clockClass !== null && data.clockClass !== undefined ? data.clockClass : 'Unknown');
+            document.getElementById('clockClass').textContent = clockClass;
+            document.getElementById('clockClass').className = clockClass === 'Unknown' ? 'value unknown' : 'value';
             document.getElementById('clockClassTimestamp').textContent = `Last updated: ${formatTimestamp(data.timestamp)}`;
 
-            // Add to event log (timestamp, source IP, method, URI, body)
+            // Add to event log
             addEventLog(data);
         }
 
@@ -440,55 +434,49 @@
             }
         }
 
+        function escapeHtml(s) {
+            if (s == null) return '';
+            const div = document.createElement('div');
+            div.textContent = s;
+            return div.innerHTML;
+        }
+
         function addEventLog(data) {
             const logDiv = document.getElementById('eventLog');
             if (logDiv.querySelector('.loading')) {
                 logDiv.innerHTML = '';
             }
 
-            const time = formatTimestamp(data.timestamp);
-            const method = data.method != null ? data.method : 'POST';
-            const uri = data.uri != null ? data.uri : '/api/events';
-            const body = data.request_body != null
-                ? (typeof data.request_body === 'string' ? data.request_body : JSON.stringify(data.request_body, null, 2))
-                : (data.request_body === undefined ? JSON.stringify(data, null, 2) : '');
+            const method = data.http_method || data.httpMethod;
+            const uri = data.http_uri || data.httpUri;
+            const version = data.http_version || data.httpVersion;
+            const connectionLine = data.connection_line || data.connectionLine;
+            const headers = data.request_headers || data.requestHeaders;
 
-            // Resolved source IP (X-Forwarded-For) shown prominently and in headers
-            var sourceIp = data.source_ip != null && data.source_ip !== '' ? data.source_ip : (data.direct_peer_ip || '-');
-            var headerLines = [];
-            headerLines.push('X-Source-IP: ' + sourceIp);
-            if (data.request_headers && typeof data.request_headers === 'object') {
-                var keys = Object.keys(data.request_headers).sort();
-                for (var i = 0; i < keys.length; i++) {
-                    headerLines.push(keys[i] + ': ' + data.request_headers[keys[i]]);
-                }
+            let parts = [`<div class="time">${escapeHtml(formatTimestamp(data.timestamp))}</div>`];
+            if (connectionLine) {
+                parts.push(`<div class="connection-line">${escapeHtml(connectionLine)}</div>`);
             }
-            var headerBlock = headerLines.join('\n');
-            var httpBlock = method + ' ' + uri + ' HTTP/1.1\n' + headerBlock + (headerBlock ? '\n\n' : '\n') + body;
+            if (method && uri && version) {
+                parts.push(`<div class="http-request-line">${escapeHtml(method)} ${escapeHtml(uri)} ${escapeHtml(version)}</div>`);
+            }
+            if (headers && typeof headers === 'object') {
+                const headerLines = Object.keys(headers).map(k => `<div class="header-line">${escapeHtml(k)}: ${escapeHtml(headers[k])}</div>`).join('');
+                parts.push(`<div class="http-headers">${headerLines}</div>`);
+            }
+            const jsonPayload = (data.request_body != null) ? data.request_body : data.requestBody;
+            const jsonStr = (jsonPayload != null) ? JSON.stringify(jsonPayload, null, 2) : JSON.stringify(data, null, 2);
+            parts.push(`<div class="data">${escapeHtml(jsonStr)}</div>`);
 
             const entry = document.createElement('div');
             entry.className = 'event-entry';
-            entry.innerHTML = `
-                <div class="time">${time}</div>
-                <div class="event-meta source-ip">Source: ${escapeHtml(sourceIp)}</div>
-                <pre class="event-http">${escapeHtml(httpBlock)}</pre>
-            `;
+            entry.innerHTML = parts.join('');
             logDiv.insertBefore(entry, logDiv.firstChild);
 
+            // Keep only last 50 entries
             while (logDiv.children.length > 50) {
                 logDiv.removeChild(logDiv.lastChild);
             }
-        }
-
-        function escapeHtml(text) {
-            var div = document.createElement('div');
-            div.textContent = text;
-            return div.innerHTML;
-        }
-        function escapeAttr(text) {
-            if (text == null) return '';
-            var s = String(text);
-            return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
         }
 
         function clearLog() {
@@ -506,18 +494,13 @@
                 .then(response => response.json())
                 .then(data => {
                     if (data.status === 'success' && data.subscriptions) {
-                        subscriptionCount = data.subscriptions.length;
                         displaySubscriptions(data.subscriptions);
                     } else {
-                        subscriptionCount = 0;
                         list.innerHTML = `<div class="empty-state">${data.message || 'No subscriptions found'}</div>`;
                     }
-                    updateConnectionStatus();
                 })
                 .catch(err => {
                     console.error('Failed to fetch subscriptions:', err);
-                    subscriptionCount = 0;
-                    updateConnectionStatus();
                     list.innerHTML = '<div class="empty-state" style="color: var(--pf-global--danger-color--100);">Failed to load subscriptions</div>';
                 });
         }
@@ -533,120 +516,53 @@
             list.innerHTML = '';
             
             subscriptions.forEach(sub => {
-                const resourceAddress = sub.resourceAddress ?? sub.ResourceAddress ?? 'Unknown';
-                const subscriptionId = sub.subscriptionId ?? sub.SubscriptionId ?? sub.subscription_id ?? 'Unknown';
-                const endpointUri = sub.endpointUri ?? sub.EndpointUri ?? 'Unknown';
-                // Prefer UriLocation for DELETE when proxy provides it (exact path proxy expects)
-                const deleteTarget = sub.uriLocation ?? sub.UriLocation ?? subscriptionId;
-                
                 const item = document.createElement('div');
                 item.className = 'subscription-item';
                 
-                const info = document.createElement('div');
-                info.className = 'subscription-info';
-                info.innerHTML = `
-                    <div class="resource">${escapeHtml(resourceAddress)}</div>
-                    <div class="details">Endpoint: ${escapeHtml(endpointUri)}</div>
-                    <div class="id">ID: ${escapeHtml(subscriptionId)}</div>
-                `;
-                item.appendChild(info);
+                const resourceAddress = sub.ResourceAddress || sub.resourceAddress || 'Unknown';
+                const subscriptionId = sub.SubscriptionId || sub.subscriptionId || 'Unknown';
+                const endpointUri = sub.EndpointUri || sub.endpointUri || 'Unknown';
                 
-                const unsubBtn = document.createElement('button');
-                unsubBtn.type = 'button';
-                unsubBtn.className = 'danger unsubscribe-btn';
-                unsubBtn.textContent = 'Unsubscribe';
-                unsubBtn.addEventListener('click', function (e) {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    if (unsubBtn.disabled) return;
-                    console.log('Unsubscribe clicked', { deleteTarget: deleteTarget, resourceAddress: resourceAddress });
-                    fetch('/api/debug/button-click?action=unsubscribe').catch(function () {});
-                    unsubBtn.disabled = true;
-                    unsubBtn.textContent = 'Unsubscribing…';
-                    unsubscribe(deleteTarget, resourceAddress, function () {
-                        unsubBtn.disabled = false;
-                        unsubBtn.textContent = 'Unsubscribe';
-                    });
-                });
-                item.appendChild(unsubBtn);
+                item.innerHTML = `
+                    <div class="subscription-info">
+                        <div class="resource">${resourceAddress}</div>
+                        <div class="details">Endpoint: ${endpointUri}</div>
+                        <div class="id">ID: ${subscriptionId}</div>
+                    </div>
+                    <button class="danger" onclick="unsubscribe('${subscriptionId}', '${resourceAddress.replace(/'/g, "\\'")}')">Unsubscribe</button>
+                `;
                 
                 list.appendChild(item);
             });
         }
 
-        function unsubscribe(deleteTarget, resourceAddress, onCancel) {
-            if (!deleteTarget || deleteTarget === 'Unknown' || deleteTarget === 'unknown') {
-                alert('Invalid subscription');
-                if (onCancel) onCancel();
-                return;
-            }
-            // No confirm() — dialog often doesn't appear in embedded/OpenShift contexts, which blocked the request.
-            // Use GET with query param so unsubscribe works even when OpenShift Route blocks POST.
-            const encoded = encodeURIComponent(deleteTarget);
-            const getUrl = '/api/subscriptions/unsubscribe?deleteTarget=' + encoded;
-            console.log('Sending GET to', getUrl);
-            fetch(getUrl, { method: 'GET' })
-                .then(function(response) {
-                    return response.text().then(function(text) {
-                        var data = {};
-                        try { data = text ? JSON.parse(text) : {}; } catch (e) {}
-                        console.log('Unsubscribe response:', response.status, text ? text.slice(0, 200) : '');
-                        return { ok: response.ok, status: response.status, data: data };
-                    });
-                })
-                .then(function(result) {
-                    if (result.ok && result.data.status === 'success') {
-                        alert('Successfully unsubscribed!');
-                        checkSubscriptions();
+        function unsubscribe(subscriptionId, resourceAddress) {
+            fetch(`/api/subscriptions/${subscriptionId}`, { method: 'DELETE' })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.status === 'success') {
+                        checkSubscriptions(); // Refresh the list
                     } else {
-                        var msg = result.data.message || result.data.error || ('HTTP ' + result.status);
-                        console.warn('Unsubscribe failed:', result.status, msg);
-                        alert('Failed to unsubscribe: ' + msg);
-                        if (onCancel) onCancel();
+                        console.error('Failed to unsubscribe:', data.message || 'Unknown error');
                     }
                 })
-                .catch(function(err) {
+                .catch(err => {
                     console.error('Failed to unsubscribe:', err);
-                    alert('Failed to unsubscribe. Please check the console for details.');
-                    if (onCancel) onCancel();
                 });
         }
 
-        function resubscribe(btn) {
-            // No confirm() — dialog often doesn't appear in embedded/OpenShift contexts.
-            var button = btn && btn.nodeName ? btn : document.getElementById('resubscribeBtn');
-            if (button) {
-                button.disabled = true;
-                button.textContent = 'Resubscribing…';
-            }
-            // Use GET so it works when Route blocks POST (same as Unsubscribe).
-            fetch('/api/subscriptions/resubscribe', { method: 'GET' })
-                .then(function(response) {
-                    return response.text().then(function(text) {
-                        var data = {};
-                        try { data = text ? JSON.parse(text) : {}; } catch (e) {}
-                        return { ok: response.ok, data: data };
-                    });
-                })
-                .then(function(result) {
-                    if (button) {
-                        button.disabled = false;
-                        button.textContent = 'Resubscribe to Events';
-                    }
-                    if (result.ok && result.data.status === 'success') {
-                        alert('Successfully resubscribed to PTP events!');
-                        checkSubscriptions();
+        function resubscribe() {
+            fetch('/api/subscriptions/resubscribe', { method: 'POST' })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.status === 'success') {
+                        checkSubscriptions(); // Refresh the subscriptions list
                     } else {
-                        alert('Failed to resubscribe: ' + (result.data.message || result.data.error || 'Unknown error'));
+                        console.error('Failed to resubscribe:', data.message || 'Unknown error');
                     }
                 })
-                .catch(function(err) {
+                .catch(err => {
                     console.error('Failed to resubscribe:', err);
-                    if (button) {
-                        button.disabled = false;
-                        button.textContent = 'Resubscribe to Events';
-                    }
-                    alert('Failed to resubscribe. Please check the console for details.');
                 });
         }
 
@@ -662,13 +578,7 @@
 
             eventSource.onopen = () => {
                 statusIndicator.className = 'status-indicator connected';
-                connectionStatus.textContent = 'Connected';
-                fetch('/api/subscriptions').then(function(r) { return r.json(); }).then(function(d) {
-                    if (d.subscriptions && Array.isArray(d.subscriptions)) {
-                        subscriptionCount = d.subscriptions.length;
-                    }
-                    updateConnectionStatus();
-                }).catch(function() { updateConnectionStatus(); });
+                connectionStatus.textContent = 'Connected - Receiving real-time updates';
             };
 
             eventSource.onmessage = (event) => {
@@ -694,18 +604,22 @@
             };
         }
 
+        function fetchVersion() {
+            fetch('/api/version')
+                .then(r => r.json())
+                .then(data => {
+                    const el = document.getElementById('appVersion');
+                    if (el && data.version) {
+                        el.textContent = 'v' + data.version;
+                        el.title = 'Version: ' + data.version;
+                    }
+                })
+                .catch(() => {});
+        }
+
         // Initialize connection on page load
         connectSSE();
-
-        // Toolbar: one delegated click handler (reliable in Firefox and when scripts load in different order)
-        document.getElementById('toolbar').addEventListener('click', function(e) {
-            var btn = e.target && e.target.closest && e.target.closest('button');
-            if (!btn || !btn.getAttribute) return;
-            var action = btn.getAttribute('data-action');
-            if (action === 'checkSubscriptions') { checkSubscriptions(); return; }
-            if (action === 'clearLog') { clearLog(); return; }
-            if (action === 'resubscribe') { resubscribe(btn); return; }
-        });
+        fetchVersion();
 
         // Cleanup on page unload
         window.addEventListener('beforeunload', () => {

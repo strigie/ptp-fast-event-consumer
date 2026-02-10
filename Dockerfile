@@ -20,7 +20,7 @@ COPY src ./src
 # Copy static files
 COPY static ./static
 
-# Build the actual application
+# Build the actual application (version from Cargo.toml)
 RUN touch src/main.rs && \
     cargo build --release && \
     strip target/release/ptp-fast-event-consumer

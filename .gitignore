@@ -18,12 +18,6 @@ Thumbs.db
 # Logs
 *.log
 
-# Sensitive / local-only (do not commit)
+# Registry auth (never commit)
+.quay-auth.json
 auth.json
-.env
-.env.*
-*.pem
-*.key
-*.crt
-*kubeconfig*
-*.kubeconfig
